@@ -51,13 +51,14 @@ threshold = st.sidebar.slider(
 st.sidebar.caption("The paper's reported results use a threshold of 0.50.")
 st.sidebar.divider()
 st.sidebar.subheader("Model")
+st.sidebar.caption(bundle.get("source", ""))
 for name, value in bundle["rf_params"].items():
     st.sidebar.text(f"{name} = {value}")
 
 st.title("Online Shopping Purchase Intention Simulator")
 st.caption(
-    "Random Forest classifier trained on the UCI Online Shoppers Purchasing "
-    "Intention Dataset."
+    "Class-weighted Random Forest classifier trained on the UCI Online "
+    "Shoppers Purchasing Intention Dataset."
 )
 
 tab_single, tab_batch, tab_perf, tab_imp = st.tabs(
@@ -174,7 +175,7 @@ with tab_single:
         "Region": region,
         "TrafficType": traffic,
         "VisitorType": visitor,
-        "Weekend": int(weekend),
+        "Weekend": bool(weekend),
     }])[bundle["features"]]
 
     prob = float(pipeline.predict_proba(session)[0, 1])
@@ -233,6 +234,8 @@ with tab_batch:
         table.insert(1, "Predicted", np.where(sim_pred, "Purchase", "No purchase"))
         table.insert(2, "Actual", np.where(sim_actual, "Purchase", "No purchase"))
         table.insert(3, "Correct", sim_pred == sim_actual)
+        table = table.round({"ProductRelated_Duration": 1, "ExitRates": 3,
+                             "PageValues": 2})
         st.dataframe(table.reset_index(drop=True))
     else:
         st.info("Press Run simulation to draw a sample of sessions.")
@@ -262,6 +265,11 @@ with tab_perf:
     m[2].metric("Recall", f"{recall:.2%}")
     m[3].metric("F1-score", f"{f1:.2%}")
     m[4].metric("ROC-AUC", f"{auc:.4f}")
+    st.caption(
+        f"For comparison, predicting 'no purchase' for every session would "
+        f"score {1 - actual.mean():.2%} accuracy while detecting no buyers, "
+        f"which is why accuracy is not read on its own."
+    )
 
     left, right = st.columns(2)
     with left:
@@ -287,6 +295,27 @@ with tab_perf:
         ax.set_ylabel("True positive rate")
         ax.legend(loc="lower right")
         st.pyplot(fig)
+
+    st.subheader("Effect of the threshold")
+    rows = []
+    for t in (0.20, 0.30, 0.40, 0.50, 0.60, 0.70):
+        t_pred = test_proba >= t
+        t_tp = int((t_pred & actual).sum())
+        t_fp = int((t_pred & ~actual).sum())
+        t_fn = int((~t_pred & actual).sum())
+        rows.append({
+            "Threshold": f"{t:.2f}",
+            "Precision": f"{t_tp / (t_tp + t_fp):.2%}" if t_tp + t_fp else "-",
+            "Recall": f"{t_tp / (t_tp + t_fn):.2%}",
+            "F1-score": f"{2 * t_tp / (2 * t_tp + t_fp + t_fn):.2%}",
+            "Buyers detected": t_tp,
+            "Buyers missed": t_fn,
+            "False alarms": t_fp,
+        })
+    st.table(pd.DataFrame(rows).set_index("Threshold"))
+    st.caption(
+        "A lower threshold detects more buyers but raises more false alarms."
+    )
 
 # --------------------------------------------------------------------------
 # Tab 4 - feature importance
