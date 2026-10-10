@@ -20,8 +20,8 @@ Live app: purchase-app-cst9l.streamlit.app
 Requires Python 3.9 or later.
 
 ```
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/kyeuan-arch/purchase-app.git
+cd purchase-app
 python -m pip install -r requirements.txt
 ```
 
