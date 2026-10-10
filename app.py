@@ -29,15 +29,37 @@ if not MODEL_FILE.exists():
     st.stop()
 
 bundle = load_bundle()
-pipeline = bundle["pipeline"]
+if "variants" not in bundle:
+    st.error("model.joblib is from an older version. Run "
+             "`python train_model.py` again to rebuild it.")
+    st.stop()
+
 options = bundle["options"]
 y_test = np.asarray(bundle["y_test"])
-test_proba = np.asarray(bundle["test_proba"])
 
 # --------------------------------------------------------------------------
 # Sidebar
 # --------------------------------------------------------------------------
+FEATURE_SETS = {
+    "Without PageValues (early-session)": "without",
+    "With PageValues (original results)": "with",
+}
 st.sidebar.title("Settings")
+feature_set = st.sidebar.radio(
+    "Feature set",
+    list(FEATURE_SETS),
+    help="PageValues is calculated from completed transactions, so it "
+    "partly contains the outcome being predicted (target leakage). The "
+    "model without it is the one that could be used before a purchase "
+    "happens.",
+)
+variant_key = FEATURE_SETS[feature_set]
+use_pv = variant_key == "with"
+variant = bundle["variants"][variant_key]
+pipeline = variant["pipeline"]
+test_proba = np.asarray(variant["test_proba"])
+lr_proba = np.asarray(variant["lr_test_proba"])
+
 threshold = st.sidebar.slider(
     "Decision threshold",
     min_value=0.05,
@@ -51,8 +73,8 @@ threshold = st.sidebar.slider(
 st.sidebar.caption("The paper's reported results use a threshold of 0.50.")
 st.sidebar.divider()
 st.sidebar.subheader("Model")
-st.sidebar.caption(bundle.get("source", ""))
-for name, value in bundle["rf_params"].items():
+st.sidebar.caption(variant.get("source", ""))
+for name, value in variant["rf_params"].items():
     st.sidebar.text(f"{name} = {value}")
 
 st.title("Online Shopping Purchase Intention Simulator")
@@ -60,10 +82,15 @@ st.caption(
     "Class-weighted Random Forest classifier trained on the UCI Online "
     "Shoppers Purchasing Intention Dataset."
 )
+if use_pv:
+    st.warning(
+        "This feature set includes PageValues, which leaks the outcome. "
+        "Scores here are inflated and are shown for comparison only."
+    )
 
-tab_single, tab_batch, tab_perf, tab_imp = st.tabs(
+tab_single, tab_batch, tab_perf, tab_cmp, tab_pv, tab_imp = st.tabs(
     ["Simulate a session", "Batch simulation", "Model performance",
-     "Feature importance"]
+     "RF vs Logistic Regression", "PageValues effect", "Feature importance"]
 )
 
 
@@ -72,6 +99,40 @@ def pick(col, wanted):
     opts = options[col]
     return opts.index(wanted) if wanted in opts else 0
 
+
+def metrics_at(proba, t):
+    pred = proba >= t
+    act = y_test.astype(bool)
+    tp = int((pred & act).sum()); tn = int((~pred & ~act).sum())
+    fp = int((pred & ~act).sum()); fn = int((~pred & act).sum())
+    prec = tp / (tp + fp) if tp + fp else 0.0
+    rec = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    return dict(tn=tn, fp=fp, fn=fn, tp=tp, acc=(tp + tn) / len(act),
+                prec=prec, rec=rec, f1=f1, auc=roc_auc_score(y_test, proba))
+
+
+def confusion_figure(m, title, cmap):
+    grid = np.array([[m["tn"], m["fp"]], [m["fn"], m["tp"]]])
+    fig, ax = plt.subplots(figsize=(4.6, 3.8))
+    ax.imshow(grid, cmap=cmap)
+    labels = ["No Purchase", "Purchase"]
+    ax.set_xticks([0, 1], labels)
+    ax.set_yticks([0, 1], labels)
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("Actual class")
+    ax.set_title(title)
+    top = grid.max()
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, f"{grid[i, j]:,}", ha="center", va="center",
+                    fontsize=14,
+                    color="white" if grid[i, j] > top / 2 else "black")
+    fig.tight_layout()
+    return fig
+
+
+baseline_acc = 1 - y_test.mean()
 
 # --------------------------------------------------------------------------
 # Tab 1 - one session
@@ -125,18 +186,22 @@ with tab_single:
             float(p["ProductRelated_Duration"]), step=30.0, key=f"pd{k}")
 
     st.subheader("Session behaviour")
-    c1, c2, c3, c4 = st.columns(4)
-    bounce = c1.slider("Bounce rate", 0.0, 0.20,
-                       min(float(p["BounceRates"]), 0.20), 0.005,
-                       format="%.3f", key=f"b{k}")
-    exit_rate = c2.slider("Exit rate", 0.0, 0.20,
-                          min(float(p["ExitRates"]), 0.20), 0.005,
-                          format="%.3f", key=f"e{k}")
-    page_values = c3.number_input("Page value", 0.0, 400.0,
-                                  float(p["PageValues"]), step=1.0, key=f"pv{k}")
-    special_day = c4.select_slider(
+    cols = st.columns(4 if use_pv else 3)
+    bounce = cols[0].slider("Bounce rate", 0.0, 0.20,
+                            min(float(p["BounceRates"]), 0.20), 0.005,
+                            format="%.3f", key=f"b{k}")
+    exit_rate = cols[1].slider("Exit rate", 0.0, 0.20,
+                               min(float(p["ExitRates"]), 0.20), 0.005,
+                               format="%.3f", key=f"e{k}")
+    special_day = cols[2].select_slider(
         "Closeness to a special day", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
         value=float(p["SpecialDay"]), key=f"s{k}")
+    if use_pv:
+        page_values = cols[3].number_input(
+            "Page value", 0.0, 400.0, float(p["PageValues"]), step=1.0,
+            key=f"pv{k}")
+    else:
+        page_values = 0.0  # not an input: this model ignores PageValues
 
     st.subheader("Visitor and context")
     c1, c2, c3, c4 = st.columns(4)
@@ -158,6 +223,8 @@ with tab_single:
     region = c3.selectbox("Region", options["Region"],
                           index=pick("Region", p["Region"]), key=f"r{k}")
 
+    # The pipeline selects its own columns by name, so the model trained
+    # without PageValues simply ignores that column.
     session = pd.DataFrame([{
         "Administrative": administrative,
         "Administrative_Duration": administrative_dur,
@@ -191,11 +258,18 @@ with tab_single:
             st.info(f"Prediction: NO PURCHASE (probability is below the "
                     f"{threshold:.2f} threshold)")
         st.progress(prob)
-    st.caption(
-        "Page value has the largest influence on the model. In a live shop "
-        "it is only known once the visitor has moved toward checkout pages, "
-        "so treat predictions that rely on it as late-session predictions."
-    )
+    if use_pv:
+        st.caption(
+            "Page value dominates this model, and it is calculated from "
+            "completed transactions. A real shop would not know it before "
+            "the purchase, so this prediction is not a true forecast."
+        )
+    else:
+        st.caption(
+            "This model uses only information available while the visitor "
+            "is still browsing. It is less accurate than the model with "
+            "PageValues, so read the probability as a rough signal."
+        )
 
 # --------------------------------------------------------------------------
 # Tab 2 - batch simulation on unseen test sessions
@@ -226,16 +300,17 @@ with tab_batch:
         m3.metric("Buyers detected", f"{caught} of {buyers}")
         m4.metric("False alarms", false_alarms)
 
-        table = bundle["X_test"].iloc[idx][
-            ["ProductRelated", "ProductRelated_Duration", "ExitRates",
-             "PageValues", "Month", "VisitorType"]
-        ].copy()
+        shown = ["ProductRelated", "ProductRelated_Duration", "ExitRates",
+                 "BounceRates", "Month", "VisitorType"]
+        if use_pv:
+            shown.insert(3, "PageValues")
+        table = bundle["X_test"].iloc[idx][shown].copy()
         table.insert(0, "Probability", sim_proba.round(3))
         table.insert(1, "Predicted", np.where(sim_pred, "Purchase", "No purchase"))
         table.insert(2, "Actual", np.where(sim_actual, "Purchase", "No purchase"))
         table.insert(3, "Correct", sim_pred == sim_actual)
         table = table.round({"ProductRelated_Duration": 1, "ExitRates": 3,
-                             "PageValues": 2})
+                             "BounceRates": 3, "PageValues": 2})
         st.dataframe(table.reset_index(drop=True))
     else:
         st.info("Press Run simulation to draw a sample of sessions.")
@@ -244,41 +319,33 @@ with tab_batch:
 # Tab 3 - performance on the full test set at the chosen threshold
 # --------------------------------------------------------------------------
 with tab_perf:
-    pred = test_proba >= threshold
+    pm = metrics_at(test_proba, threshold)
     actual = y_test.astype(bool)
-    tp = int((pred & actual).sum())
-    tn = int((~pred & ~actual).sum())
-    fp = int((pred & ~actual).sum())
-    fn = int((~pred & actual).sum())
-    accuracy = (tp + tn) / len(actual)
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    f1 = (2 * precision * recall / (precision + recall)
-          if (precision + recall) else 0.0)
-    auc = roc_auc_score(y_test, test_proba)
 
     st.write(f"Evaluated on {len(actual):,} unseen test sessions at a "
              f"threshold of {threshold:.2f}.")
     m = st.columns(5)
-    m[0].metric("Accuracy", f"{accuracy:.2%}")
-    m[1].metric("Precision", f"{precision:.2%}")
-    m[2].metric("Recall", f"{recall:.2%}")
-    m[3].metric("F1-score", f"{f1:.2%}")
-    m[4].metric("ROC-AUC", f"{auc:.4f}")
+    m[0].metric("Accuracy", f"{pm['acc']:.2%}")
+    m[1].metric("Precision", f"{pm['prec']:.2%}")
+    m[2].metric("Recall", f"{pm['rec']:.2%}")
+    m[3].metric("F1-score", f"{pm['f1']:.2%}")
+    m[4].metric("ROC-AUC", f"{pm['auc']:.4f}")
     st.caption(
         f"For comparison, predicting 'no purchase' for every session would "
-        f"score {1 - actual.mean():.2%} accuracy while detecting no buyers, "
+        f"score {baseline_acc:.2%} accuracy while detecting no buyers, "
         f"which is why accuracy is not read on its own."
     )
+    if pm["acc"] < baseline_acc:
+        st.warning(
+            f"At this threshold the model's accuracy ({pm['acc']:.2%}) is "
+            f"below that baseline ({baseline_acc:.2%}). Its value is in the "
+            f"buyers it detects, not in overall accuracy."
+        )
 
     left, right = st.columns(2)
     with left:
         st.subheader("Confusion matrix")
-        st.table(pd.DataFrame(
-            [[tn, fp], [fn, tp]],
-            index=["Actual: No purchase", "Actual: Purchase"],
-            columns=["Predicted: No purchase", "Predicted: Purchase"],
-        ))
+        st.pyplot(confusion_figure(pm, "Random Forest", "Blues"))
         st.caption(
             "Move the threshold in the sidebar to see how false negatives "
             "trade against false positives."
@@ -287,10 +354,10 @@ with tab_perf:
         st.subheader("ROC curve")
         fpr, tpr, _ = roc_curve(y_test, test_proba)
         fig, ax = plt.subplots(figsize=(5, 4))
-        ax.plot(fpr, tpr, label=f"Random Forest (AUC = {auc:.4f})")
+        ax.plot(fpr, tpr, label=f"Random Forest (AUC = {pm['auc']:.4f})")
         ax.plot([0, 1], [0, 1], linestyle="--", label="Random classifier")
-        ax.scatter([fp / (fp + tn)], [recall], color="red", zorder=3,
-                   label=f"Threshold {threshold:.2f}")
+        ax.scatter([pm["fp"] / (pm["fp"] + pm["tn"])], [pm["rec"]],
+                   color="red", zorder=3, label=f"Threshold {threshold:.2f}")
         ax.set_xlabel("False positive rate")
         ax.set_ylabel("True positive rate")
         ax.legend(loc="lower right")
@@ -299,18 +366,15 @@ with tab_perf:
     st.subheader("Effect of the threshold")
     rows = []
     for t in (0.20, 0.30, 0.40, 0.50, 0.60, 0.70):
-        t_pred = test_proba >= t
-        t_tp = int((t_pred & actual).sum())
-        t_fp = int((t_pred & ~actual).sum())
-        t_fn = int((~t_pred & actual).sum())
+        tm = metrics_at(test_proba, t)
         rows.append({
             "Threshold": f"{t:.2f}",
-            "Precision": f"{t_tp / (t_tp + t_fp):.2%}" if t_tp + t_fp else "-",
-            "Recall": f"{t_tp / (t_tp + t_fn):.2%}",
-            "F1-score": f"{2 * t_tp / (2 * t_tp + t_fp + t_fn):.2%}",
-            "Buyers detected": t_tp,
-            "Buyers missed": t_fn,
-            "False alarms": t_fp,
+            "Precision": f"{tm['prec']:.2%}" if tm["tp"] + tm["fp"] else "-",
+            "Recall": f"{tm['rec']:.2%}",
+            "F1-score": f"{tm['f1']:.2%}",
+            "Buyers detected": tm["tp"],
+            "Buyers missed": tm["fn"],
+            "False alarms": tm["fp"],
         })
     st.table(pd.DataFrame(rows).set_index("Threshold"))
     st.caption(
@@ -318,14 +382,130 @@ with tab_perf:
     )
 
 # --------------------------------------------------------------------------
-# Tab 4 - feature importance
+# Tab 4 - Random Forest vs Logistic Regression
+# --------------------------------------------------------------------------
+with tab_cmp:
+    rf_m = metrics_at(test_proba, threshold)
+    lr_m = metrics_at(lr_proba, threshold)
+    st.write(f"Both models evaluated on the same {len(y_test):,} unseen "
+             f"test sessions at a threshold of {threshold:.2f}, "
+             f"{'with' if use_pv else 'without'} PageValues.")
+    names = ["Accuracy", "Precision", "Recall", "F1-score", "ROC-AUC"]
+    keys = ["acc", "prec", "rec", "f1", "auc"]
+    st.table(pd.DataFrame({
+        "Metric": names,
+        "Random Forest": [f"{rf_m[k]:.2%}" for k in keys],
+        "Logistic Regression": [f"{lr_m[k]:.2%}" for k in keys],
+    }).set_index("Metric"))
+
+    x = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(8, 3.8))
+    b1 = ax.bar(x - 0.18, [rf_m[k] * 100 for k in keys], 0.36,
+                label="Random Forest")
+    b2 = ax.bar(x + 0.18, [lr_m[k] * 100 for k in keys], 0.36,
+                label="Logistic Regression")
+    for bars in (b1, b2):
+        for bar in bars:
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 1, f"{bar.get_height():.1f}",
+                    ha="center", fontsize=8)
+    ax.set_xticks(x, names)
+    ax.set_ylim(0, 110)
+    ax.set_ylabel("Score (%)")
+    ax.legend(loc="lower right")
+    ax.set_title("Performance comparison")
+    fig.tight_layout()
+    st.pyplot(fig)
+
+    st.subheader("Confusion matrices")
+    c1, c2 = st.columns(2)
+    c1.pyplot(confusion_figure(rf_m, "Random Forest", "Blues"))
+    c2.pyplot(confusion_figure(lr_m, "Logistic Regression", "Greens"))
+    st.caption(
+        f"Random Forest missed {rf_m['fn']} buyers with {rf_m['fp']} "
+        f"false alarms; Logistic Regression missed {lr_m['fn']} buyers "
+        f"with {lr_m['fp']} false alarms."
+    )
+
+    st.subheader("ROC curve comparison")
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    for proba, label in ((test_proba, "Random Forest"),
+                         (lr_proba, "Logistic Regression")):
+        fpr, tpr, _ = roc_curve(y_test, proba)
+        ax.plot(fpr, tpr,
+                label=f"{label} (AUC = {roc_auc_score(y_test, proba):.4f})")
+    ax.plot([0, 1], [0, 1], linestyle="--", label="Random classifier")
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    st.pyplot(fig)
+
+# --------------------------------------------------------------------------
+# Tab 5 - effect of PageValues (target leakage)
+# --------------------------------------------------------------------------
+with tab_pv:
+    pvp = bundle["pv_positive"]
+    st.write(
+        "PageValues is calculated by Google Analytics from completed "
+        "transactions, so it partly contains the outcome the model is "
+        "trying to predict. This is called target leakage."
+    )
+    c1, c2 = st.columns(2)
+    c1.metric("Purchase sessions with PageValues > 0",
+              f"{pvp['purchase']:.1%}")
+    c2.metric("Non-purchase sessions with PageValues > 0",
+              f"{pvp['no_purchase']:.1%}")
+
+    st.subheader(f"Same models, with and without PageValues "
+                 f"(threshold {threshold:.2f})")
+    v_with, v_without = bundle["variants"]["with"], bundle["variants"]["without"]
+    runs = {
+        "RF with": metrics_at(np.asarray(v_with["test_proba"]), threshold),
+        "RF without": metrics_at(np.asarray(v_without["test_proba"]), threshold),
+        "LR with": metrics_at(np.asarray(v_with["lr_test_proba"]), threshold),
+        "LR without": metrics_at(np.asarray(v_without["lr_test_proba"]), threshold),
+    }
+    names = ["Accuracy", "Precision", "Recall", "F1-score", "ROC-AUC"]
+    keys = ["acc", "prec", "rec", "f1", "auc"]
+    table = {"Metric": names + ["False alarms", "Buyers missed"]}
+    for label, mm in runs.items():
+        table[label] = ([f"{mm[k]:.2%}" for k in keys]
+                        + [f"{mm['fp']:,}", f"{mm['fn']:,}"])
+    st.table(pd.DataFrame(table).set_index("Metric"))
+
+    x = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(9, 4))
+    for i, (label, mm) in enumerate(runs.items()):
+        ax.bar(x + (i - 1.5) * 0.2, [mm[k] * 100 for k in keys], 0.2,
+               label=label)
+    ax.axhline(baseline_acc * 100, linestyle="--", color="grey", linewidth=1)
+    ax.text(len(names) - 0.5, baseline_acc * 100 + 1,
+            "always 'no purchase' accuracy", ha="right", fontsize=8,
+            color="grey")
+    ax.set_xticks(x, names)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("Score (%)")
+    ax.legend(ncol=4, loc="lower center", fontsize=8)
+    fig.tight_layout()
+    st.pyplot(fig)
+    st.caption(
+        f"Predicting 'no purchase' for every session scores "
+        f"{baseline_acc:.2%} accuracy. Without PageValues the models "
+        f"depend on browsing behaviour alone, which is only moderately "
+        f"predictive."
+    )
+
+# --------------------------------------------------------------------------
+# Tab 6 - feature importance
 # --------------------------------------------------------------------------
 with tab_imp:
-    top = bundle["importances"].head(15)
+    top = variant["importances"].head(15)
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.barh(top.index[::-1], top.values[::-1])
     ax.set_xlabel("Feature importance")
-    ax.set_title("Top 15 features")
+    ax.set_title(f"Top 15 features ({'with' if use_pv else 'without'} "
+                 f"PageValues)")
     st.pyplot(fig)
     st.caption(
         "Importance shows how useful a feature was to the model's "
